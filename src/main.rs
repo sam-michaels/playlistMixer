@@ -133,6 +133,11 @@ fn valid_date(s: &str) -> bool {
     s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
 }
 
+// YYYY-MM-DD -> DD/MM/YYYY; input already passed valid_date
+fn dmy(s: &str) -> String {
+    format!("{}/{}/{}", &s[8..10], &s[5..7], &s[..4])
+}
+
 fn prompt(msg: &str) -> String {
     print!("{msg}");
     io::stdout().flush().ok();
@@ -179,7 +184,7 @@ fn main() -> Result<()> {
         println!("Nothing left to add.");
         return Ok(());
     }
-    let default = format!("Mix {} → {}", a.from, a.to);
+    let default = format!("{} - {}", dmy(&a.from), dmy(&a.to));
     let name = prompt(&format!("Playlist name [{default}]: "));
     let name = if name.is_empty() { default } else { name };
     let ids: Vec<String> = kept.into_iter().map(|t| t.id).collect();
@@ -221,6 +226,7 @@ mod tests {
         for bad in ["2026-6-1", "2026/06/01", "", "2026-06-01x"] {
             assert!(!valid_date(bad), "{bad}");
         }
+        assert_eq!(dmy("2026-04-30"), "30/04/2026");
     }
 
     #[test]
