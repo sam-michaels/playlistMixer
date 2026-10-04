@@ -167,9 +167,10 @@ fn iso(s: &str) -> String {
     format!("{}-{}-{}", &s[6..], &s[3..5], &s[..2])
 }
 
-fn form_error(from: &str, to: &str, vibe: &str) -> Option<String> {
+// The vibe is optional: without one, every liked song in the range is listed.
+fn form_error(from: &str, to: &str) -> Option<String> {
     let e = if from.is_empty() && to.is_empty() {
-        if vibe.trim().is_empty() { "Describe a vibe first" } else { return None }
+        return None;
     } else if from.is_empty() || to.is_empty() {
         "Fill both dates, or leave both empty for any date"
     } else if !valid_date(from) {
@@ -178,8 +179,6 @@ fn form_error(from: &str, to: &str, vibe: &str) -> Option<String> {
         "To must be DD/MM/YYYY"
     } else if iso(from) > iso(to) {
         "From is after To"
-    } else if vibe.trim().is_empty() {
-        "Describe a vibe first"
     } else {
         return None;
     };
@@ -273,17 +272,15 @@ mod tests {
 
     #[test]
     fn form() {
-        let e = |f, t, v| form_error(f, t, v);
-        assert_eq!(e("x", "01/02/2026", "v").unwrap(), "From must be DD/MM/YYYY");
-        assert_eq!(e("01/01/2026", "x", "v").unwrap(), "To must be DD/MM/YYYY");
-        assert_eq!(e("02/01/2026", "01/01/2026", "v").unwrap(), "From is after To");
-        assert_eq!(e("01/01/2026", "02/01/2026", "  ").unwrap(), "Describe a vibe first");
-        assert!(e("01/01/2026", "02/01/2026", "v").is_none());
-        assert!(e("", "", "v").is_none());
-        assert_eq!(e("", "", " ").unwrap(), "Describe a vibe first");
+        let e = form_error;
+        assert_eq!(e("x", "01/02/2026").unwrap(), "From must be DD/MM/YYYY");
+        assert_eq!(e("01/01/2026", "x").unwrap(), "To must be DD/MM/YYYY");
+        assert_eq!(e("02/01/2026", "01/01/2026").unwrap(), "From is after To");
+        assert!(e("01/01/2026", "02/01/2026").is_none());
+        assert!(e("", "").is_none());
         let msg = "Fill both dates, or leave both empty for any date";
-        assert_eq!(e("", "01/02/2026", "v").unwrap(), msg);
-        assert_eq!(e("01/01/2026", "", "v").unwrap(), msg);
+        assert_eq!(e("", "01/02/2026").unwrap(), msg);
+        assert_eq!(e("01/01/2026", "").unwrap(), msg);
     }
 
     #[test]

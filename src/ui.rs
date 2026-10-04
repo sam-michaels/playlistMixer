@@ -72,6 +72,12 @@ impl App {
             return Action::None;
         }
         self.error = None;
+        // An Enter typed while songs load arrives as Ctrl-J (newline); don't let it act as 'j'.
+        let key = if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        } else {
+            key
+        };
         match self.screen {
             Screen::Menu => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.menu_sel = 0,
@@ -131,15 +137,20 @@ impl App {
             KeyCode::Left | KeyCode::Right if self.token.is_some() => {
                 self.to_spotify = key.code == KeyCode::Right
             }
-            KeyCode::Enter => return Action::Create,
+            // Creating is deliberate: only Enter in the name box creates; in the list Enter toggles.
+            KeyCode::Enter if self.name_focus => return Action::Create,
             KeyCode::Up if !self.name_focus => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Down if !self.name_focus => {
                 self.cursor = (self.cursor + 1).min(self.picks.len().saturating_sub(1))
             }
-            KeyCode::Char(' ') if !self.name_focus => {
+            KeyCode::Char(' ') | KeyCode::Enter if !self.name_focus => {
                 if let Some(c) = self.checked.get_mut(self.cursor) {
                     *c = !*c;
                 }
+            }
+            KeyCode::Char('a') if !self.name_focus => {
+                let all = self.checked.iter().all(|c| *c);
+                self.checked.iter_mut().for_each(|c| *c = !all);
             }
             KeyCode::Backspace if self.name_focus => {
                 self.name.pop();
@@ -157,7 +168,7 @@ impl App {
     }
 
     fn generate(&mut self, term: &mut DefaultTerminal) -> Result<()> {
-        if let Some(e) = form_error(&self.from, &self.to, &self.vibe) {
+        if let Some(e) = form_error(&self.from, &self.to) {
             self.error = Some(e);
             return Ok(());
         }
@@ -170,7 +181,11 @@ impl App {
             return Ok(());
         }
         let mut capped = false;
+        let no_vibe = self.vibe.trim().is_empty();
         let res = (|| -> Result<Vec<Track>> {
+            if no_vibe {
+                return Ok(pool.clone()); // no vibe: list every liked song in range, skip the model
+            }
             let n = pool.chunks(80).count();
             let mut ids = Vec::new();
             for (i, b) in pool.chunks(80).enumerate() {
@@ -197,10 +212,12 @@ impl App {
                 self.checked = vec![true; p.len()];
                 self.picks = p;
                 self.cursor = 0;
-                self.name = if any {
-                    self.vibe.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(40).collect()
-                } else {
+                self.name = if !any {
                     format!("{} - {}", self.from, self.to)
+                } else if no_vibe {
+                    "All liked songs".into()
+                } else {
+                    self.vibe.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(40).collect()
                 };
                 self.name_focus = false;
                 self.screen = Screen::Results;
@@ -294,10 +311,11 @@ impl App {
         let hint = match self.screen {
             Screen::Menu => "↑↓ move · Enter select · q/Esc quit",
             Screen::Form => "Tab/Shift-Tab next · Enter confirm · Esc menu · Ctrl-C quit",
-            Screen::Results if self.token.is_some() => {
-                "↑↓ move · Space toggle · ←→ save to · Tab list/name · Enter create · Esc back · Ctrl-C quit"
+            Screen::Results if self.name_focus && self.token.is_some() => {
+                "Type a name · ←→ save to · Enter CREATE playlist · Tab back to list · Esc back"
             }
-            Screen::Results => "↑↓ move · Space toggle · Tab list/name · Enter create · Esc back · Ctrl-C quit",
+            Screen::Results if self.name_focus => "Type a name · Enter CREATE playlist · Tab back to list · Esc back",
+            Screen::Results => "↑↓ move · Space/Enter tick · a all/none · Tab → name & create · Esc back",
             Screen::Done(_) => "any key → menu",
         };
         f.render_widget(Paragraph::new(hint).dark_gray(), foot);
@@ -321,9 +339,9 @@ impl App {
                 f.render_widget(field("To", &self.to, "DD/MM/YYYY", self.focus == 1), b);
                 f.render_widget(
                     field(
-                        "Vibe profile",
+                        "Vibe profile (optional)",
                         &self.vibe,
-                        "e.g. Start restless and moody in June, build to carefree road-trip energy in July, end nostalgic",
+                        "Leave empty to list every liked song in the range. Or describe it, e.g. Start restless and moody in June, build to carefree road-trip energy in July, end nostalgic",
                         self.focus == 2,
                     ),
                     vibe,
@@ -349,7 +367,10 @@ impl App {
                     .collect();
                 self.list.select(Some(self.cursor));
                 let l = List::new(items)
-                    .block(boxed(format!("Picks ({})", self.picks.len()), !self.name_focus))
+                    .block(boxed(
+                        format!("Picks ({} of {} selected)", self.checked.iter().filter(|c| **c).count(), self.picks.len()),
+                        !self.name_focus,
+                    ))
                     .highlight_symbol("› ")
                     .highlight_style(Style::new().add_modifier(Modifier::BOLD));
                 f.render_stateful_widget(l, list, &mut self.list);
@@ -443,5 +464,30 @@ mod tests {
         a.focus = 0;
         type_str(&mut a, "x");
         assert_eq!(a.from, "01/06/2026");
+    }
+
+    #[test]
+    fn results_ticking() {
+        let t = |id: &str| Track {
+            id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(),
+            added: None, played: None,
+        };
+        let mut a = App::new(vec![], "m".into(), None);
+        a.picks = vec![t("1"), t("2"), t("3")];
+        a.checked = vec![true; 3];
+        a.screen = Screen::Results;
+        // Enter in the list unticks instead of creating
+        assert_eq!(a.on_key(k(KeyCode::Enter)), Action::None);
+        assert_eq!(a.checked, [false, true, true]);
+        a.on_key(k(KeyCode::Down));
+        a.on_key(k(KeyCode::Char(' ')));
+        assert_eq!(a.checked, [false, false, true]);
+        a.on_key(k(KeyCode::Char('a'))); // not all ticked -> tick all
+        assert_eq!(a.checked, [true; 3]);
+        a.on_key(k(KeyCode::Char('a'))); // all ticked -> untick all
+        assert_eq!(a.checked, [false; 3]);
+        // Tab to the name box, then Enter creates
+        a.on_key(k(KeyCode::Tab));
+        assert_eq!(a.on_key(k(KeyCode::Enter)), Action::Create);
     }
 }
