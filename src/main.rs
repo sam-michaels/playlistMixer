@@ -2,10 +2,21 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
-use std::io::{self, Write};
+mod spotify;
+mod ui;
+
 use std::process::Command;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long, default_value = "qwen2.5:7b")]
+    model: String,
+    /// spotify (liked songs) or apple (Music.app favourites)
+    #[arg(long, default_value = "spotify", value_parser = ["spotify", "apple"])]
+    source: String,
+}
 
 #[derive(Deserialize, Clone)]
 #[allow(dead_code)]
@@ -19,38 +30,30 @@ struct Track {
     played: Option<String>, // ISO-8601 strings
 }
 
-#[derive(Parser)]
-struct Args {
-    /// Start date, YYYY-MM-DD
-    #[arg(long)]
-    from: String,
-    /// End date, YYYY-MM-DD
-    #[arg(long)]
-    to: String,
-    #[arg(long, default_value = "qwen2.5:7b")]
-    model: String,
-    /// How the period felt
-    description: String,
-}
-
 const READ_JS: &str = r#"
 const M = Application('Music');
-const t = M.libraryPlaylists[0].tracks.whose({favorited: true});
+const names = M.userPlaylists.name(); const i = names.findIndex(n=>/^Favou?rite Songs$/.test(n));
+const t = (i>=0 ? M.userPlaylists[i] : M.libraryPlaylists[0]).tracks.whose({favorited: true});
 const id=t.persistentID(), n=t.name(), a=t.artist(), al=t.album(), g=t.genre(), ad=t.dateAdded(), pl=t.playedDate();
+const seen = new Set();
 JSON.stringify(id.map((x,i)=>({id:x,name:n[i],artist:a[i],album:al[i],genre:g[i],
-  added: ad[i]?ad[i].toISOString():null, played: pl[i]?pl[i].toISOString():null})))
+  added: ad[i]?ad[i].toISOString():null, played: pl[i]?pl[i].toISOString():null})).filter(o=>!seen.has(o.id)&&seen.add(o.id)))
 "#;
 
 const CREATE_JS: &str = r#"
 function run(argv){
   const M=Application('Music'), lib=M.libraryPlaylists[0];
+  const names=M.userPlaylists.name(), i=names.findIndex(n=>/^Favou?rite Songs$/.test(n));
+  const srcs=(i>=0?[M.userPlaylists[i],lib]:[lib]);
   const p=M.UserPlaylist({name: argv[0]}).make();
-  argv.slice(1).forEach(id=>{ const t=lib.tracks.whose({persistentID:id}); if(t.length) M.duplicate(t[0],{to:p}); });
+  argv.slice(1).forEach(id=>{
+    for(const s of srcs){ const t=s.tracks.whose({persistentID:id}); if(t.length){ M.duplicate(t[0],{to:p}); break; } }
+  });
   return p.tracks.length;
 }
 "#;
 
-const SYSTEM: &str = r#"You choose songs for a playlist. The user describes how a period of their life felt. From the numbered song list, return JSON {"ids": [...]} with the ids of songs whose mood, sound or lyrics fit the description. Use what you know about each song. Return only ids from the list."#;
+const SYSTEM: &str = r#"You choose songs for a playlist. The user gives a vibe profile: the moods of a period of their life and how the playlist should flow. From the numbered song list, return JSON {"ids": [...]} with the numbers of the songs whose mood, sound or lyrics fit the description. Use what you know about each song. Return only numbers from the list."#;
 
 fn osascript(js: &str, args: &[&str]) -> Result<String> {
     let out = Command::new("osascript")
@@ -88,15 +91,54 @@ fn keep_known(ids: Vec<String>, batch: &[Track]) -> Vec<String> {
         .collect()
 }
 
-fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
-    let mut user = format!("{desc}\n");
-    for t in batch {
+fn song_lines(batch: &[Track]) -> String {
+    let mut s = String::new();
+    for (i, t) in batch.iter().enumerate() {
         let added = t.added.as_deref().and_then(|d| d.get(..10)).unwrap_or("?");
-        user += &format!("\n{} | {} | {} | {} | added {}", t.id, t.name, t.artist, t.genre, added);
+        s += &format!("\n{} | {} | {} | {} | added {}", i + 1, t.name, t.artist, t.genre, added);
     }
+    s
+}
+
+// numbers are 1-based positions in the list sent; accepts numbers or numeric strings, ignores the rest
+fn ids_from_numbers(nums: Vec<serde_json::Value>, batch: &[Track]) -> Vec<String> {
+    nums.iter()
+        .filter_map(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .filter_map(|n| batch.get((n as usize).checked_sub(1)?))
+        .map(|t| t.id.clone())
+        .collect()
+}
+
+fn norm(s: &str) -> String {
+    let cut = [" (", " [", " - "].iter().filter_map(|p| s.find(p)).min().unwrap_or(s.len());
+    s[..cut].to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn key(t: &Track) -> String {
+    let first = t.artist.split([',', '&']).next().unwrap_or("");
+    format!("{}|{}", norm(&t.name), norm(first))
+}
+
+fn match_to_apple(picks: &[Track], apple: &[Track]) -> (Vec<String>, Vec<String>) {
+    let mut by_key = std::collections::HashMap::new();
+    for a in apple.iter().filter(|a| !norm(&a.name).is_empty()) {
+        by_key.entry(key(a)).or_insert(&a.id);
+    }
+    let (mut ids, mut missing) = (vec![], vec![]);
+    for p in picks {
+        match Some(p).filter(|p| !norm(&p.name).is_empty()).and_then(|p| by_key.get(&key(p))) {
+            Some(id) => ids.push((*id).clone()),
+            None => missing.push(format!("{} — {}", p.name, p.artist)),
+        }
+    }
+    (ids, missing)
+}
+
+fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
+    let user = format!("{desc}\n{}", song_lines(batch));
     let body = json!({
         "model": model, "stream": false, "format": "json",
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_ctx": 16384},
         "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
     });
     let resp: serde_json::Value = ureq::post("http://localhost:11434/api/chat")
@@ -106,91 +148,91 @@ fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
     let content = resp["message"]["content"].as_str().ok_or("no message.content in Ollama reply")?;
     #[derive(Deserialize)]
     struct Ids {
-        ids: Vec<String>,
+        ids: Vec<serde_json::Value>,
     }
     let ids: Ids = serde_json::from_str(content)?;
-    Ok(keep_known(ids.ids, batch))
-}
-
-fn parse_drops(s: &str, len: usize) -> HashSet<usize> {
-    s.split(|c: char| c.is_whitespace() || c == ',')
-        .filter_map(|w| w.parse::<usize>().ok())
-        .filter(|&n| n >= 1 && n <= len)
-        .collect()
-}
-
-fn review(picks: &[Track]) -> Vec<Track> {
-    for (i, t) in picks.iter().enumerate() {
-        let added = t.added.as_deref().and_then(|d| d.get(..10)).unwrap_or("?");
-        println!("{}. {} — {} (added {})", i + 1, t.name, t.artist, added);
-    }
-    let line = prompt("Drop which? (e.g. 3 7 12, Enter to keep all) ");
-    let drops = parse_drops(&line, picks.len());
-    picks.iter().enumerate().filter(|(i, _)| !drops.contains(&(i + 1))).map(|(_, t)| t.clone()).collect()
+    Ok(keep_known(ids_from_numbers(ids.ids, batch), batch))
 }
 
 fn valid_date(s: &str) -> bool {
-    s.len() == 10 && s.bytes().enumerate().all(|(i, c)| if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() })
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| if i == 2 || i == 5 { *c == b'/' } else { c.is_ascii_digit() })
+        && matches!(s[..2].parse::<u8>(), Ok(1..=31))
+        && matches!(s[3..5].parse::<u8>(), Ok(1..=12))
 }
 
-// YYYY-MM-DD -> DD/MM/YYYY; input already passed valid_date
-fn dmy(s: &str) -> String {
-    format!("{}/{}/{}", &s[8..10], &s[5..7], &s[..4])
+// DD/MM/YYYY -> YYYY-MM-DD; input already passed valid_date
+fn iso(s: &str) -> String {
+    format!("{}-{}-{}", &s[6..], &s[3..5], &s[..2])
 }
 
-fn prompt(msg: &str) -> String {
-    print!("{msg}");
-    io::stdout().flush().ok();
-    let mut s = String::new();
-    if !matches!(io::stdin().read_line(&mut s), Ok(n) if n > 0) {
-        println!("\nCancelled.");
-        std::process::exit(0);
+fn form_error(from: &str, to: &str, vibe: &str) -> Option<String> {
+    let e = if from.is_empty() && to.is_empty() {
+        if vibe.trim().is_empty() { "Describe a vibe first" } else { return None }
+    } else if from.is_empty() || to.is_empty() {
+        "Fill both dates, or leave both empty for any date"
+    } else if !valid_date(from) {
+        "From must be DD/MM/YYYY"
+    } else if !valid_date(to) {
+        "To must be DD/MM/YYYY"
+    } else if iso(from) > iso(to) {
+        "From is after To"
+    } else if vibe.trim().is_empty() {
+        "Describe a vibe first"
+    } else {
+        return None;
+    };
+    Some(e.into())
+}
+
+fn fill_order(ids: Vec<String>, picks: &[Track]) -> Vec<String> {
+    let mut out = keep_known(ids, picks);
+    let have: HashSet<String> = out.iter().cloned().collect();
+    out.extend(picks.iter().filter(|t| !have.contains(&t.id)).map(|t| t.id.clone()));
+    out
+}
+
+// ponytail: one ordering call for all picks; skipped above 150 picks (keeps pick order), batch it if that matters
+fn order(picks: &[Track], vibe: &str, model: &str) -> Result<Vec<String>> {
+    let user = format!("{vibe}\n{}", song_lines(picks));
+    let sys = r#"Arrange these songs into a playlist whose sequence follows the vibe profile's flow from start to end. Return JSON {"ids": [...]} containing the number of every song exactly once, in playing order."#;
+    let body = json!({
+        "model": model, "stream": false, "format": "json",
+        "options": {"temperature": 0.2, "num_ctx": 16384},
+        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+    });
+    let resp: serde_json::Value = ureq::post("http://localhost:11434/api/chat")
+        .send_json(body)
+        .map_err(|e| format!("Ollama request failed ({e}); start Ollama and run: ollama pull {model}"))?
+        .into_json()?;
+    let content = resp["message"]["content"].as_str().ok_or("no message.content in Ollama reply")?;
+    #[derive(Deserialize)]
+    struct Ids {
+        ids: Vec<serde_json::Value>,
     }
-    s.trim().to_string()
+    let ids: Ids = serde_json::from_str(content)?;
+    Ok(fill_order(ids_from_numbers(ids.ids, picks), picks))
 }
 
-fn create_playlist(name: &str, ids: &[String]) -> Result<usize> {
+fn create_apple_playlist(name: &str, ids: &[String]) -> Result<usize> {
     let mut args = vec![name];
     args.extend(ids.iter().map(String::as_str));
     Ok(osascript(CREATE_JS, &args)?.parse()?)
 }
 
 fn main() -> Result<()> {
-    let a = Args::parse();
-    for (flag, v) in [("--from", &a.from), ("--to", &a.to)] {
-        if !valid_date(v) {
-            return Err(format!("{flag} must be YYYY-MM-DD, got {v}").into());
-        }
+    let args = Args::parse();
+    if args.source == "apple" {
+        println!("Reading your Music library…");
+        let tracks = read_favorites()?;
+        return ui::run(tracks, args.model, None);
     }
-    let tracks: Vec<Track> = read_favorites()?.into_iter().filter(|t| in_range(t, &a.from, &a.to)).collect();
-    if tracks.is_empty() {
-        println!("No favorites in {}..{}.", a.from, a.to);
-        return Ok(());
-    }
-    let mut ids = Vec::new();
-    for b in tracks.chunks(80) {
-        ids.extend(pick(b, &a.description, &a.model)?);
-    }
-    let picks: Vec<Track> = ids
-        .iter()
-        .filter_map(|id| tracks.iter().find(|t| &t.id == id).cloned())
-        .collect();
-    if picks.is_empty() {
-        println!("No songs matched that description.");
-        return Ok(());
-    }
-    let kept = review(&picks);
-    if kept.is_empty() {
-        println!("Nothing left to add.");
-        return Ok(());
-    }
-    let default = format!("{} - {}", dmy(&a.from), dmy(&a.to));
-    let name = prompt(&format!("Playlist name [{default}]: "));
-    let name = if name.is_empty() { default } else { name };
-    let ids: Vec<String> = kept.into_iter().map(|t| t.id).collect();
-    let n = create_playlist(&name, &ids)?;
-    println!("Added {n} tracks to \"{name}\"");
-    Ok(())
+    println!("Logging in to Spotify…");
+    let token = spotify::login()?;
+    println!("Loading your liked songs…");
+    let tracks = spotify::read_likes(&token)?;
+    ui::run(tracks, args.model, Some(token))
 }
 
 #[cfg(test)]
@@ -222,18 +264,52 @@ mod tests {
 
     #[test]
     fn dates() {
-        assert!(valid_date("2026-06-01"));
-        for bad in ["2026-6-1", "2026/06/01", "", "2026-06-01x"] {
+        assert!(valid_date("01/06/2026"));
+        for bad in ["2026-04-30", "32/01/2026", "01/13/2026", "1/4/2026", ""] {
             assert!(!valid_date(bad), "{bad}");
         }
-        assert_eq!(dmy("2026-04-30"), "30/04/2026");
+        assert_eq!(iso("30/04/2026"), "2026-04-30");
     }
 
     #[test]
-    fn drops() {
-        assert_eq!(parse_drops("3 7, 12", 20), HashSet::from([3, 7, 12]));
-        assert!(parse_drops("", 5).is_empty());
-        assert_eq!(parse_drops("0 2 9", 5), HashSet::from([2]));
-        assert!(parse_drops("abc -1 x2", 5).is_empty());
+    fn form() {
+        let e = |f, t, v| form_error(f, t, v);
+        assert_eq!(e("x", "01/02/2026", "v").unwrap(), "From must be DD/MM/YYYY");
+        assert_eq!(e("01/01/2026", "x", "v").unwrap(), "To must be DD/MM/YYYY");
+        assert_eq!(e("02/01/2026", "01/01/2026", "v").unwrap(), "From is after To");
+        assert_eq!(e("01/01/2026", "02/01/2026", "  ").unwrap(), "Describe a vibe first");
+        assert!(e("01/01/2026", "02/01/2026", "v").is_none());
+        assert!(e("", "", "v").is_none());
+        assert_eq!(e("", "", " ").unwrap(), "Describe a vibe first");
+        let msg = "Fill both dates, or leave both empty for any date";
+        assert_eq!(e("", "01/02/2026", "v").unwrap(), msg);
+        assert_eq!(e("01/01/2026", "", "v").unwrap(), msg);
+    }
+
+    #[test]
+    fn numbers() {
+        let b = [tr("a", None, None), tr("b", None, None), tr("c", None, None)];
+        let nums = vec![json!(1), json!("2"), json!(99), json!("x")];
+        assert_eq!(ids_from_numbers(nums, &b), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn apple_match() {
+        let t = |id: &str, n: &str, a: &str| Track {
+            id: id.into(), name: n.into(), artist: a.into(), album: String::new(), genre: String::new(),
+            added: None, played: None,
+        };
+        let apple = [t("A1", "Mr. Brightside - 2004 Remaster", "The Killers"), t("A2", "Song", "A")];
+        let picks = [t("s1", "Mr. Brightside", "The Killers"), t("s2", "Song (feat. X)", "A, B"), t("s3", "Nope", "Z"), t("s4", "!!!", "Q")];
+        let (ids, missing) = match_to_apple(&picks, &apple);
+        assert_eq!(ids, vec!["A1", "A2"]);
+        assert_eq!(missing, vec!["Nope — Z", "!!! — Q"]);
+    }
+
+    #[test]
+    fn fill() {
+        let p = [tr("a", None, None), tr("b", None, None), tr("c", None, None)];
+        let ids = ["c", "x", "c", "a"].map(String::from).to_vec();
+        assert_eq!(fill_order(ids, &p), vec!["c", "a", "b"]);
     }
 }
