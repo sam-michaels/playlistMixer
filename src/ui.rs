@@ -38,6 +38,8 @@ struct App {
     name_focus: bool,
     quit: bool,
     token: Option<String>,
+    playing: Option<usize>, // index in picks of the previewed song
+    paused: bool,           // our view of Spotify's state after p presses
     to_spotify: bool, // Results save target; default Apple Music
 }
 
@@ -62,6 +64,8 @@ impl App {
             name_focus: false,
             quit: false,
             token,
+            playing: None,
+            paused: false,
             to_spotify: true, // Spotify is the default save target (only offered with the Spotify source)
         }
     }
@@ -148,6 +152,16 @@ impl App {
                     *c = !*c;
                 }
             }
+            KeyCode::Char('p') if !self.name_focus && self.token.is_some() && !self.picks.is_empty() => {
+                if self.playing == Some(self.cursor) {
+                    spotify::toggle_pause();
+                    self.paused = !self.paused;
+                } else {
+                    spotify::play_preview(&self.picks[self.cursor].id);
+                    self.playing = Some(self.cursor);
+                    self.paused = false;
+                }
+            }
             KeyCode::Char('a') if !self.name_focus => {
                 let all = self.checked.iter().all(|c| *c);
                 self.checked.iter_mut().for_each(|c| *c = !all);
@@ -210,6 +224,7 @@ impl App {
                 self.checked = vec![true; p.len()];
                 self.picks = p;
                 self.cursor = 0;
+                self.playing = None;
                 self.name = if !any {
                     format!("{} - {}", self.from, self.to)
                 } else if no_vibe {
@@ -311,6 +326,9 @@ impl App {
                 "Type a name · ←→ save to · Enter CREATE playlist · Tab back to list · Esc back"
             }
             Screen::Results if self.name_focus => "Type a name · Enter CREATE playlist · Tab back to list · Esc back",
+            Screen::Results if self.token.is_some() => {
+                "↑↓ move · Space/Enter tick · p play/pause · a all/none · Tab → name & create · Esc back"
+            }
             Screen::Results => "↑↓ move · Space/Enter tick · a all/none · Tab → name & create · Esc back",
             Screen::Done(_) => "any key → menu",
         };
@@ -369,9 +387,19 @@ impl App {
                     .picks
                     .iter()
                     .zip(&self.checked)
-                    .map(|(t, c)| {
+                    .enumerate()
+                    .map(|(i, (t, c))| {
                         let d = t.added.as_deref().filter(|d| d.len() >= 10).map_or("?".into(), |d| format!("{}/{}", &d[8..10], &d[5..7]));
-                        ListItem::new(format!("[{}] {} — {}   {d}", if *c { 'x' } else { ' ' }, t.name, t.artist))
+                        let mut spans = vec![ratatui::text::Span::raw(format!(
+                            "[{}] {} — {}   {d}",
+                            if *c { 'x' } else { ' ' },
+                            t.name,
+                            t.artist
+                        ))];
+                        if self.playing == Some(i) {
+                            spans.push(if self.paused { " ‖ paused".dark_gray() } else { " ♪".fg(SPOTIFY_GREEN) });
+                        }
+                        ListItem::new(ratatui::text::Line::from(spans))
                     })
                     .collect();
                 self.list.select(Some(self.cursor));
@@ -545,5 +573,27 @@ mod tests {
         // Tab to the name box, then Enter creates
         a.on_key(k(KeyCode::Tab));
         assert_eq!(a.on_key(k(KeyCode::Enter)), Action::Create);
+    }
+
+    #[test]
+    fn preview_key() {
+        let t = |id: &str| Track {
+            id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(),
+            added: None, played: None,
+        };
+        let mut a = App::new(vec![], "m".into(), Some("tok".into()));
+        a.picks = vec![t("1"), t("2")];
+        a.checked = vec![true; 2];
+        a.screen = Screen::Results;
+        a.on_key(k(KeyCode::Down));
+        a.on_key(k(KeyCode::Char('p')));
+        assert_eq!(a.playing, Some(1));
+        a.on_key(k(KeyCode::Char('p'))); // same song: pause toggle, still the playing one
+        assert_eq!((a.playing, a.paused), (Some(1), true));
+        a.on_key(k(KeyCode::Char('p')));
+        assert!(!a.paused);
+        a.on_key(k(KeyCode::Tab)); // name box: p types
+        a.on_key(k(KeyCode::Char('p')));
+        assert_eq!(a.name, "p");
     }
 }

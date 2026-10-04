@@ -255,3 +255,83 @@ Skip items where `track` is null (local or unavailable songs). Put the mapping o
 4. You make a summer 2024 playlist: Generate, check the picks have dates in range, save to **Apple Music**, and check the "not found" list. Then make another and save it to **Spotify**. Check both appear.
 5. Restart `playlistMixer`. It should not ask you to log in again, because the token refresh works.
 6. Commit and push v2, v2.1 and v3, then `cargo install --path ~/playlistMixer`.
+
+---
+
+# playlistMixer v4: play songs in Spotify + instant startup
+
+## Context
+You want to hear songs while you pick through results, in the Spotify app, and you want the app to stay fast. Two changes:
+1. **Press `p` to preview** the highlighted song in Spotify.app, starting about a third of the way in (roughly the chorus). Press `p` again to pause.
+2. **Cache your likes locally**, so startup makes about one request instead of about 25.
+
+While planning I also found a **real bug** in `read_likes` (`src/spotify.rs:208`). It pages with `offset = all.len()`, but `all` excludes the unavailable songs it skipped (`track: null`). The offset falls behind and pages get fetched twice, which duplicates songs. That likely explains why the count went from 1,201 to 1,249. The fix: follow Spotify's `next` URL and remove duplicates by ID.
+
+What I checked on your Mac: `/Applications/Spotify.app` can be scripted, and it supports `play track "<uri>"`, `playpause`, `player position` (seconds, settable) and `current track`'s `duration` / `id`. Local scripting needs **no API call, no new login scope and no network**.
+
+## Workflow
+This plan (you review) → Sonnet implementer → Codex review → I triage with you → explainer.
+
+---
+
+## Spec for the implementer
+
+### 1. Preview playback (`src/ui.rs`, plus a new `src/spotify.rs` function)
+- **`pub fn play_preview(uri: &str)`** in `src/spotify.rs`. It is **non-blocking**: it runs `std::thread::spawn` and calls `osascript -e <script> <uri>` in the background (`Command::new("osascript")...status()`), ignoring errors, so the UI never waits. Script, using an AppleScript `on run argv` handler:
+  ```applescript
+  on run argv
+    set u to item 1 of argv
+    tell application "Spotify"
+      play track u
+      repeat 40 times
+        if (id of current track) is u then exit repeat
+        delay 0.05
+      end repeat
+      set d to duration of current track
+      if d > 10000 then set d to d / 1000 -- Spotify reports ms despite the dictionary saying seconds
+      set player position to d / 3
+    end tell
+  end run
+  ```
+- **`pub fn toggle_pause()`** runs `tell application "Spotify" to playpause`, non-blocking in the same way.
+- **`App` gets `playing: Option<usize>`**, the index in `picks` of the previewed song.
+- **Results keys** (list focused, and only when the source is Spotify, i.e. `token.is_some()`):
+  - `p` on a different song than `playing` → `play_preview(&picks[cursor].id)` and set `playing = Some(cursor)`.
+  - `p` on the same song → `toggle_pause()`.
+  - In the name box, `p` still types into the name, as it does now.
+- **Drawing:** the row whose index equals `playing` shows ` ♪` after the date, in Spotify green (`SPOTIFY_GREEN`). The list footer hint gains `p play/pause`. Reset `playing = None` whenever new results load in `generate`.
+- **The Apple source is unchanged.** There's no `p` there, because you only use Spotify.
+- **No playback API scopes and no re-login.**
+
+### 2. Likes cache and paging fix (`src/spotify.rs`)
+- **`Track`** (`src/main.rs:21`) also derives `Serialize`.
+- **Cache file** `~/.config/playlistMixer/likes.json` holds `{"total": <Spotify's total>, "tracks": [Track…]}`, newest first. Write it the plain way; it isn't secret.
+- **`parse_likes_page`** returns `(tracks, next: Option<String>, total: u64, raw_ids: Vec<Option<String>>)`, or something equivalent. The **raw item count** (including null tracks) and the URIs are needed so the incremental check is exact. Keep the existing test passing (update it as needed).
+- **`read_likes(token)`**:
+  1. Load the cache. If it's missing or corrupt, do a **full fetch**.
+  2. **Incremental:** follow `next` URLs from `…/me/tracks?limit=50` and collect items until you reach a track whose URI is the cache's newest URI. Count every raw item before that point as `new_raw`, then stop.
+     - If `total == cache.total + new_raw` → the result is `new tracks ++ cache.tracks`.
+     - Otherwise (you unliked something, or the newest cached song wasn't found within 5 pages) → **full fetch**.
+  3. **Full fetch:** follow `next` URLs to the end, never computing the offset yourself, and **remove duplicates by URI** while keeping the first occurrence.
+  4. Save the cache with the latest `total`, and return.
+- Put the decision in **`fn merge_likes(new: Vec<Track>, new_raw: u64, total: u64, cache: Cache) -> Option<Vec<Track>>`**. It returns `None` when a full fetch is needed, so it can be tested without the network.
+
+### Tests (`#[cfg(test)]`, all existing tests stay)
+- `merge_likes`:
+  - 2 new + cache of 3 with matching totals → 5, in order.
+  - totals don't match → `None`.
+  - 0 new, same total → the cache unchanged.
+- Full-fetch duplicate removal: a helper `dedupe_by_id(Vec<Track>)` removes a repeated URI and keeps order.
+- `results` key test: with `token = Some(..)`, `p` sets `playing = Some(cursor)`. Calling `play_preview` from a test is fine because errors are ignored, but **guard the actual spawn with `#[cfg(not(test))]`** so tests never touch Spotify.
+
+### Out of scope
+Apple Music preview, auto-preview while scrolling, and stopping playback when you quit (music keeps playing, the same as using Spotify itself).
+
+---
+
+## Verification
+1. `cargo build` with zero warnings and `cargo test` all green. I check this myself.
+2. **First startup after the change** does a full fetch and writes `likes.json`. I compare the song count with **your Spotify Liked Songs total**, and check that duplicates are gone (the count should drop from 1,249 if the paging bug was duplicating songs).
+3. **Second startup:** I time it. Loading likes should take well under a second, compared with a few seconds now.
+4. **You** open Results, press `p` on a song, and hear it in Spotify about a third of the way in, with ♪ shown next to it. `p` again pauses. `p` on another song switches to it.
+5. Codex review → triage → explainer → commit, push and `cargo install`.

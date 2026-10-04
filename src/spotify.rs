@@ -1,5 +1,6 @@
 use crate::{Result, Track};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -179,11 +180,12 @@ fn api(token: &str, method: &str, url: &str, body: Option<Value>) -> Result<Valu
     Err("Spotify rate limit: retries exhausted".into())
 }
 
-fn parse_likes_page(v: &Value) -> (Vec<Track>, bool) {
-    let tracks = v["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
+type LikesPage = (Vec<Track>, Option<String>, u64, Vec<Option<String>>);
+
+/// (tracks without nulls, next url, Spotify's total, URI of every raw item incl. null tracks)
+fn parse_likes_page(v: &Value) -> LikesPage {
+    let items = || v["items"].as_array().into_iter().flatten();
+    let tracks = items()
         .filter(|i| !i["track"].is_null())
         .map(|i| {
             let t = &i["track"];
@@ -199,19 +201,118 @@ fn parse_likes_page(v: &Value) -> (Vec<Track>, bool) {
             }
         })
         .collect();
-    (tracks, !v["next"].is_null())
+    let raw = items().map(|i| i["track"]["uri"].as_str().map(Into::into)).collect();
+    (tracks, v["next"].as_str().map(Into::into), v["total"].as_u64().unwrap_or(0), raw)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Cache {
+    total: u64,
+    tracks: Vec<Track>,
+}
+
+fn cache_path() -> Result<PathBuf> {
+    Ok(dir()?.join("likes.json"))
+}
+
+/// New tracks + cache when the totals add up; None means do a full fetch.
+fn merge_likes(new: Vec<Track>, new_raw: u64, total: u64, cache: Cache) -> Option<Vec<Track>> {
+    (total == cache.total + new_raw).then(|| new.into_iter().chain(cache.tracks).collect())
+}
+
+fn dedupe_by_id(tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen = std::collections::HashSet::new();
+    tracks.into_iter().filter(|t| seen.insert(t.id.clone())).collect()
+}
+
+/// Follow `next` urls, stopping at the `stop` URI (not included) or after `max_pages`.
+/// Returns (tracks, raw items before the stop, total, stop found).
+fn fetch_likes(token: &str, stop: Option<&str>, max_pages: usize) -> Result<(Vec<Track>, u64, u64, bool)> {
+    let mut url = Some("https://api.spotify.com/v1/me/tracks?limit=50".to_string());
+    let (mut all, mut new_raw, mut total) = (vec![], 0, 0);
+    for _ in 0..max_pages {
+        let Some(u) = url else { break };
+        let (tracks, next, t, raw) = parse_likes_page(&api(token, "GET", &u, None)?);
+        total = t;
+        let mut tracks = tracks.into_iter();
+        for id in raw {
+            if stop.is_some() && id.as_deref() == stop {
+                return Ok((all, new_raw, total, true));
+            }
+            new_raw += 1;
+            if id.is_some() {
+                all.extend(tracks.next());
+            }
+        }
+        url = next;
+    }
+    Ok((all, new_raw, total, false))
 }
 
 pub fn read_likes(token: &str) -> Result<Vec<Track>> {
-    let mut all = vec![];
-    loop {
-        let url = format!("https://api.spotify.com/v1/me/tracks?limit=50&offset={}", all.len());
-        let (page, has_next) = parse_likes_page(&api(token, "GET", &url, None)?);
-        all.extend(page);
-        if !has_next {
-            return Ok(all);
+    let cache: Option<Cache> =
+        cache_path().ok().and_then(|p| fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok());
+    let mut total = 0;
+    let mut tracks = None;
+    if let Some(c) = cache.filter(|c| !c.tracks.is_empty()) {
+        let newest = c.tracks[0].id.clone();
+        let (new, new_raw, t, found) = fetch_likes(token, Some(&newest), 5)?;
+        total = t;
+        if found {
+            tracks = merge_likes(new, new_raw, t, c);
         }
     }
+    let tracks = match tracks {
+        Some(t) => t,
+        None => {
+            let (all, _, t, _) = fetch_likes(token, None, usize::MAX)?;
+            total = t;
+            dedupe_by_id(all)
+        }
+    };
+    // best effort: a failed cache write only costs a full fetch next time
+    if let Ok(p) = cache_path() {
+        // write-then-rename so an interrupted write never leaves a corrupt cache
+        let tmp = p.with_extension("json.tmp");
+        let _ = fs::create_dir_all(dir()?)
+            .and_then(|_| fs::write(&tmp, serde_json::to_string(&Cache { total, tracks: tracks.clone() })?))
+            .and_then(|_| fs::rename(&tmp, &p));
+    }
+    Ok(tracks)
+}
+
+#[cfg(not(test))]
+fn osa(script: &'static str, args: Vec<String>) {
+    // fire and forget: the UI never waits on Spotify, errors are ignored
+    std::thread::spawn(move || {
+        let _ = Command::new("osascript").arg("-e").arg(script).args(args).status();
+    });
+}
+#[cfg(test)]
+fn osa(_: &'static str, _: Vec<String>) {} // tests never touch Spotify
+
+/// Play a track about a third of the way in (Spotify desktop, via AppleScript).
+pub fn play_preview(uri: &str) {
+    osa(
+        r#"on run argv
+  set u to item 1 of argv
+  tell application "Spotify"
+    play track u
+    repeat 40 times
+      if (id of current track) is u then exit repeat
+      delay 0.05
+    end repeat
+    set d to duration of current track
+    if d > 10000 then set d to d / 1000
+    set player position to d / 3
+  end tell
+end run"#,
+        vec![uri.to_string()],
+    );
+}
+
+pub fn toggle_pause() {
+    osa(r#"tell application "Spotify" to playpause"#, vec![]);
 }
 
 pub fn create_playlist(token: &str, name: &str, uris: &[String]) -> Result<usize> {
@@ -256,12 +357,36 @@ mod tests {
               "artists": [{"name": "A"}, {"name": "B"}], "album": {"name": "Alb"}}},
             {"added_at": "2024-07-02T10:00:00Z", "track": null}
         ], "next": null});
-        let (t, next) = parse_likes_page(&v);
-        assert!(!next);
+        let (t, next, _, raw) = parse_likes_page(&v);
+        assert!(next.is_none());
+        assert_eq!(raw, vec![Some("spotify:track:1".to_string()), None]);
         assert_eq!(t.len(), 1);
         assert_eq!((t[0].id.as_str(), t[0].name.as_str(), t[0].artist.as_str(), t[0].album.as_str()),
             ("spotify:track:1", "Song", "A, B", "Alb"));
         assert_eq!(t[0].added.as_deref(), Some("2024-07-01T10:00:00Z"));
         assert!(t[0].genre.is_empty() && t[0].played.is_none());
+    }
+
+    fn tk(id: &str) -> Track {
+        Track { id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(), added: None, played: None }
+    }
+    fn ids(v: &[Track]) -> Vec<&str> {
+        v.iter().map(|t| t.id.as_str()).collect()
+    }
+    fn cache() -> Cache {
+        Cache { total: 3, tracks: vec![tk("c"), tk("d"), tk("e")] }
+    }
+
+    #[test]
+    fn merge() {
+        let r = merge_likes(vec![tk("a"), tk("b")], 2, 5, cache()).unwrap();
+        assert_eq!(ids(&r), ["a", "b", "c", "d", "e"]);
+        assert!(merge_likes(vec![tk("a")], 1, 5, cache()).is_none());
+        assert_eq!(ids(&merge_likes(vec![], 0, 3, cache()).unwrap()), ["c", "d", "e"]);
+    }
+
+    #[test]
+    fn dedupe() {
+        assert_eq!(ids(&dedupe_by_id(vec![tk("a"), tk("b"), tk("a"), tk("c")])), ["a", "b", "c"]);
     }
 }
