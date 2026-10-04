@@ -1,4 +1,4 @@
-use crate::{create_apple_playlist, form_error, in_range, iso, match_to_apple, order, pick, read_favorites, spotify, Result, Track};
+use crate::{create_apple_playlist, form_error, in_dates, match_to_apple, order, pick, read_favorites, spotify, Result, Track};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -62,7 +62,7 @@ impl App {
             name_focus: false,
             quit: false,
             token,
-            to_spotify: false,
+            to_spotify: true, // Spotify is the default save target (only offered with the Spotify source)
         }
     }
 
@@ -173,9 +173,7 @@ impl App {
             return Ok(());
         }
         let any = self.from.is_empty();
-        let (f, t) = (iso(&self.from), iso(&self.to));
-        let pool: Vec<Track> =
-            self.tracks.iter().filter(|x| any || in_range(x, &f, &t)).cloned().collect();
+        let pool = in_dates(&self.tracks, &self.from, &self.to);
         if pool.is_empty() {
             self.error = Some("No favorites between those dates".into());
             return Ok(());
@@ -287,22 +285,20 @@ impl App {
         let [head, body, msg, foot] =
             Layout::vertical([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1), Constraint::Length(1)])
                 .areas(f.area());
-        f.render_widget(
-            Paragraph::new(vec![
-                " ░░ playlistMixer ░░ ".bold().cyan().into(),
-                if self.token.is_some() {
-                    format!(" {} liked songs on Spotify · {}", self.tracks.len(), self.model)
-                } else {
-                    format!(
-                        " {} favourites · {} with dates · {}",
-                        self.tracks.len(),
-                        self.tracks.iter().filter(|t| t.added.is_some()).count(),
-                        self.model
-                    )
-                }.dark_gray().into(),
-            ]),
-            head,
-        );
+        let stats = if self.token.is_some() {
+            format!("{} liked songs on Spotify · {}", self.tracks.len(), self.model)
+        } else {
+            format!(
+                "{} favourites · {} with dates · {}",
+                self.tracks.len(),
+                self.tracks.iter().filter(|t| t.added.is_some()).count(),
+                self.model
+            )
+        };
+        // The menu draws its own big logo and stats, so the header is only shown on the other screens.
+        if !matches!(self.screen, Screen::Menu) {
+            f.render_widget(Paragraph::new(vec![wordmark(), format!(" {stats}").dark_gray().into()]), head);
+        }
         if let Some(e) = &self.error {
             f.render_widget(Paragraph::new(e.as_str()).red(), msg);
         } else if let Some(s) = &self.status {
@@ -324,12 +320,25 @@ impl App {
             Screen::Menu => {
                 let item = |i: usize, s: &str| -> ratatui::text::Line {
                     if self.menu_sel == i {
-                        format!("› {s}").cyan().bold().into()
+                        format!("› {s}").fg(SPOTIFY_GREEN).bold().into()
                     } else {
                         format!("  {s}").into()
                     }
                 };
-                f.render_widget(Paragraph::new(vec![item(0, "New playlist"), item(1, "Quit")]), body);
+                let mut lines: Vec<ratatui::text::Line> = NOTE
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| format!("{l:<NOTE_W$}").fg(green(i as f32 / (NOTE.len() - 1) as f32)).into())
+                    .collect();
+                lines.extend([
+                    "".into(),
+                    wordmark(),
+                    stats.clone().dark_gray().into(),
+                    "".into(),
+                    item(0, "New playlist"),
+                    item(1, "Quit        "),
+                ]);
+                f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), body);
             }
             Screen::Form => {
                 let [dates, vibe, button] =
@@ -376,8 +385,23 @@ impl App {
                 f.render_stateful_widget(l, list, &mut self.list);
                 f.render_widget(field("Playlist name", &self.name, "", self.name_focus), name);
                 if self.token.is_some() {
-                    let (a, b) = if self.to_spotify { ("Apple Music", "‹ Spotify ›") } else { ("‹ Apple Music ›", "Spotify") };
-                    f.render_widget(Paragraph::new(format!("Save to:  {a}  {b}")), save);
+                    // Brand colours: the chosen target is bracketed and bold, the other is dimmed.
+                    let opt = |label: &str, color: Color, on: bool| {
+                        if on {
+                            format!("‹ {label} ›").fg(color).bold()
+                        } else {
+                            format!("  {label}  ").fg(color).add_modifier(Modifier::DIM)
+                        }
+                    };
+                    f.render_widget(
+                        Paragraph::new(ratatui::text::Line::from(vec![
+                            "Save to:  ".into(),
+                            opt("Apple Music", APPLE_RED, !self.to_spotify),
+                            "  ".into(),
+                            opt("Spotify", SPOTIFY_GREEN, self.to_spotify),
+                        ])),
+                        save,
+                    );
                 }
             }
             Screen::Done(m) => {
@@ -387,6 +411,38 @@ impl App {
             }
         }
     }
+}
+
+const SPOTIFY_GREEN: Color = Color::Rgb(30, 215, 96);
+const APPLE_RED: Color = Color::Rgb(250, 36, 60);
+
+// Two beamed eighth notes; every line is padded to NOTE_W so centring keeps the shape.
+const NOTE_W: usize = 26;
+const NOTE: [&str; 9] = [
+    "        ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+    "        ██████████████████",
+    "        ██▀▀▀▀▀▀▀▀▀▀▀▀▀▀██",
+    "        ██              ██",
+    "        ██              ██",
+    "        ██              ██",
+    "  ▄▄▄▄▄▄██        ▄▄▄▄▄▄██",
+    "██████████      ██████████",
+    "▀████████▀      ▀████████▀",
+];
+
+/// Green that deepens from Spotify green (t = 0) to a darker forest green (t = 1).
+fn green(t: f32) -> Color {
+    let mix = |a: f32, b: f32| (a + (b - a) * t).round() as u8;
+    Color::Rgb(mix(30.0, 18.0), mix(215.0, 120.0), mix(96.0, 58.0))
+}
+
+/// " ♫  p l a y l i s t   m i x e r" with a per-letter green gradient.
+fn wordmark() -> ratatui::text::Line<'static> {
+    let text: Vec<char> = " ♫  p l a y l i s t   m i x e r".chars().collect();
+    let n = (text.len() - 1) as f32;
+    let spans: Vec<ratatui::text::Span> =
+        text.iter().enumerate().map(|(i, c)| c.to_string().fg(green(i as f32 / n)).bold()).collect();
+    ratatui::text::Line::from(spans)
 }
 
 fn boxed<'a>(title: impl Into<ratatui::text::Line<'a>>, focused: bool) -> Block<'a> {

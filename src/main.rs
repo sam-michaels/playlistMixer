@@ -162,9 +162,17 @@ fn valid_date(s: &str) -> bool {
         && matches!(s[3..5].parse::<u8>(), Ok(1..=12))
 }
 
-// DD/MM/YYYY -> YYYY-MM-DD; input already passed valid_date
-fn iso(s: &str) -> String {
-    format!("{}-{}-{}", &s[6..], &s[3..5], &s[..2])
+// DD/MM/YYYY -> YYYY-MM-DD; None unless the input is a valid date (never panics on blank input)
+fn iso(s: &str) -> Option<String> {
+    valid_date(s).then(|| format!("{}-{}-{}", &s[6..], &s[3..5], &s[..2]))
+}
+
+/// Tracks in the DD/MM/YYYY range, or every track when both dates are blank.
+fn in_dates(tracks: &[Track], from: &str, to: &str) -> Vec<Track> {
+    match (iso(from), iso(to)) {
+        (Some(f), Some(t)) => tracks.iter().filter(|x| in_range(x, &f, &t)).cloned().collect(),
+        _ => tracks.to_vec(), // form_error already rejected anything but both-blank
+    }
 }
 
 // The vibe is optional: without one, every liked song in the range is listed.
@@ -267,7 +275,12 @@ mod tests {
         for bad in ["2026-04-30", "32/01/2026", "01/13/2026", "1/4/2026", ""] {
             assert!(!valid_date(bad), "{bad}");
         }
-        assert_eq!(iso("30/04/2026"), "2026-04-30");
+        assert_eq!(iso("30/04/2026").as_deref(), Some("2026-04-30"));
+        assert_eq!(iso(""), None);
+        // regression: blank dates used to panic in iso(); they must mean "every track"
+        let all = [tr("a", Some("2024-07-01T00:00:00Z"), None), tr("b", Some("2020-01-01T00:00:00Z"), None)];
+        assert_eq!(in_dates(&all, "", "").len(), 2);
+        assert_eq!(in_dates(&all, "01/06/2024", "31/08/2024").len(), 1);
     }
 
     #[test]
