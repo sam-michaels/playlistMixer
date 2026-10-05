@@ -199,7 +199,7 @@ impl App {
                 return Ok(pool.clone()); // no vibe: list every liked song in range, skip the model
             }
             let n = pool.chunks(80).count();
-            let mut ids = Vec::new();
+            let mut ids = std::collections::HashSet::new();
             for (i, b) in pool.chunks(80).enumerate() {
                 self.busy(term, format!("Picking songs… batch {}/{n}", i + 1))?;
                 ids.extend(pick(b, &self.vibe, &self.model)?);
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn results_ticking() {
         let t = |id: &str| Track {
-            id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(),
+            id: id.into(), name: "n".into(), artist: "a".into(), genre: "".into(),
             added: None, played: None,
         };
         let mut a = App::new(vec![], "m".into(), None);
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn preview_key() {
         let t = |id: &str| Track {
-            id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(),
+            id: id.into(), name: "n".into(), artist: "a".into(), genre: "".into(),
             added: None, played: None,
         };
         let mut a = App::new(vec![], "m".into(), Some("tok".into()));

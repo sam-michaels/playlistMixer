@@ -22,6 +22,13 @@ fn dir() -> Result<PathBuf> {
     Ok(PathBuf::from(std::env::var("HOME")?).join(".config/playlistMixer"))
 }
 
+/// Creates the config dir, private to this user (other Mac accounts can't read the cache).
+fn make_dir() -> std::io::Result<()> {
+    let d = dir().map_err(|e| std::io::Error::other(e.to_string()))?;
+    fs::create_dir_all(&d)?;
+    fs::set_permissions(d, fs::Permissions::from_mode(0o700))
+}
+
 fn client_id() -> Result<String> {
     let path = dir()?.join("config.json");
     if let Ok(s) = fs::read_to_string(&path) {
@@ -37,7 +44,7 @@ fn client_id() -> Result<String> {
     if id.is_empty() {
         return Err("No Client ID given".into());
     }
-    fs::create_dir_all(dir()?)?;
+    make_dir()?;
     fs::write(&path, json!({ "client_id": id }).to_string())?;
     Ok(id)
 }
@@ -80,7 +87,7 @@ fn token_request(form: &[(&str, &str)], old_refresh: Option<&str>) -> Result<Str
         "access_token": access, "refresh_token": refresh,
         "expires_at": now() + v["expires_in"].as_u64().unwrap_or(3600),
     });
-    fs::create_dir_all(dir()?)?;
+    make_dir()?;
     let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(dir()?.join("token.json"))?;
     f.set_permissions(fs::Permissions::from_mode(0o600))?;
     f.write_all(t.to_string().as_bytes())?;
@@ -128,7 +135,7 @@ pub fn login() -> Result<String> {
         if BufReader::new((&stream).take(8192)).read_line(&mut line).is_err() {
             continue;
         }
-        if line.starts_with("GET /callback?") {
+        if line.starts_with("GET /callback?") && line.contains(&format!("state={state}")) {
             break (stream, line);
         }
         let _ = (&stream).write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -165,7 +172,7 @@ fn api(token: &str, method: &str, url: &str, body: Option<Value>) -> Result<Valu
                 return Ok(if s.trim().is_empty() { Value::Null } else { serde_json::from_str(&s)? });
             }
             Err(ureq::Error::Status(429, resp)) if attempt < 3 => {
-                let secs = resp.header("Retry-After").and_then(|v| v.trim().parse().ok()).unwrap_or(2);
+                let secs = resp.header("Retry-After").and_then(|v| v.trim().parse().ok()).unwrap_or(2).min(30);
                 std::thread::sleep(std::time::Duration::from_secs(secs));
             }
             Err(ureq::Error::Status(403, _)) => {
@@ -194,7 +201,6 @@ fn parse_likes_page(v: &Value) -> LikesPage {
                 id: s(&t["uri"]),
                 name: s(&t["name"]),
                 artist: t["artists"].as_array().into_iter().flatten().map(|a| s(&a["name"])).collect::<Vec<_>>().join(", "),
-                album: s(&t["album"]["name"]),
                 genre: String::new(),
                 added: i["added_at"].as_str().map(Into::into),
                 played: None,
@@ -244,7 +250,7 @@ fn fetch_likes(token: &str, stop: Option<&str>, max_pages: usize) -> Result<(Vec
                 all.extend(tracks.next());
             }
         }
-        url = next;
+        url = next.filter(|n| n.starts_with("https://api.spotify.com/"));
     }
     Ok((all, new_raw, total, false))
 }
@@ -274,7 +280,7 @@ pub fn read_likes(token: &str) -> Result<Vec<Track>> {
     if let Ok(p) = cache_path() {
         // write-then-rename so an interrupted write never leaves a corrupt cache
         let tmp = p.with_extension("json.tmp");
-        let _ = fs::create_dir_all(dir()?)
+        let _ = make_dir()
             .and_then(|_| fs::write(&tmp, serde_json::to_string(&Cache { total, tracks: tracks.clone() })?))
             .and_then(|_| fs::rename(&tmp, &p));
     }
@@ -361,14 +367,14 @@ mod tests {
         assert!(next.is_none());
         assert_eq!(raw, vec![Some("spotify:track:1".to_string()), None]);
         assert_eq!(t.len(), 1);
-        assert_eq!((t[0].id.as_str(), t[0].name.as_str(), t[0].artist.as_str(), t[0].album.as_str()),
-            ("spotify:track:1", "Song", "A, B", "Alb"));
+        assert_eq!((t[0].id.as_str(), t[0].name.as_str(), t[0].artist.as_str()),
+            ("spotify:track:1", "Song", "A, B"));
         assert_eq!(t[0].added.as_deref(), Some("2024-07-01T10:00:00Z"));
         assert!(t[0].genre.is_empty() && t[0].played.is_none());
     }
 
     fn tk(id: &str) -> Track {
-        Track { id: id.into(), name: "n".into(), artist: "a".into(), album: "".into(), genre: "".into(), added: None, played: None }
+        Track { id: id.into(), name: "n".into(), artist: "a".into(), genre: "".into(), added: None, played: None }
     }
     fn ids(v: &[Track]) -> Vec<&str> {
         v.iter().map(|t| t.id.as_str()).collect()

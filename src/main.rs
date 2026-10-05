@@ -1,4 +1,3 @@
-use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -9,22 +8,58 @@ use std::process::Command;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Parser)]
+#[derive(Debug, PartialEq)]
 struct Args {
-    #[arg(long, default_value = "qwen2.5:7b")]
     model: String,
-    /// spotify (liked songs) or apple (Music.app favourites)
-    #[arg(long, default_value = "spotify", value_parser = ["spotify", "apple"])]
     source: String,
 }
 
+const USAGE: &str = "playmx
+
+Make playlists from your liked songs by vibe and date range
+
+Usage: playmx [OPTIONS]
+
+Options:
+      --model <MODEL>    [default: qwen2.5:7b]
+      --source <SOURCE>  spotify (liked songs) or apple (Music.app favourites) [default: spotify]
+  -h, --help             Print help
+  -V, --version          Print version
+";
+
+// Err("--help") / Err("--version") are sentinels that main turns into output + exit 0.
+fn parse_args(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, String> {
+    let mut a = Args { model: "qwen2.5:7b".into(), source: "spotify".into() };
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (arg, None),
+        };
+        match flag.as_str() {
+            "-h" | "--help" => return Err("--help".into()),
+            "-V" | "--version" => return Err("--version".into()),
+            "--model" | "--source" => {
+                let v = inline.or_else(|| it.next()).filter(|v| !v.starts_with('-'))
+                    .ok_or(format!("a value is required for '{flag}'"))?;
+                if flag == "--model" {
+                    a.model = v;
+                } else if v == "spotify" || v == "apple" {
+                    a.source = v;
+                } else {
+                    return Err(format!("invalid value '{v}' for '--source' (use spotify or apple)"));
+                }
+            }
+            _ => return Err(format!("unexpected argument '{flag}'")),
+        }
+    }
+    Ok(a)
+}
+
 #[derive(Serialize, Deserialize, Clone)]
-#[allow(dead_code)]
 struct Track {
     id: String,
     name: String,
     artist: String,
-    album: String,
     genre: String,
     added: Option<String>,
     played: Option<String>, // ISO-8601 strings
@@ -34,9 +69,9 @@ const READ_JS: &str = r#"
 const M = Application('Music');
 const names = M.userPlaylists.name(); const i = names.findIndex(n=>/^Favou?rite Songs$/.test(n));
 const t = (i>=0 ? M.userPlaylists[i] : M.libraryPlaylists[0]).tracks.whose({favorited: true});
-const id=t.persistentID(), n=t.name(), a=t.artist(), al=t.album(), g=t.genre(), ad=t.dateAdded(), pl=t.playedDate();
+const id=t.persistentID(), n=t.name(), a=t.artist(), g=t.genre(), ad=t.dateAdded(), pl=t.playedDate();
 const seen = new Set();
-JSON.stringify(id.map((x,i)=>({id:x,name:n[i],artist:a[i],album:al[i],genre:g[i],
+JSON.stringify(id.map((x,i)=>({id:x,name:n[i],artist:a[i],genre:g[i],
   added: ad[i]?ad[i].toISOString():null, played: pl[i]?pl[i].toISOString():null})).filter(o=>!seen.has(o.id)&&seen.add(o.id)))
 "#;
 
@@ -134,12 +169,12 @@ fn match_to_apple(picks: &[Track], apple: &[Track]) -> (Vec<String>, Vec<String>
     (ids, missing)
 }
 
-fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
-    let user = format!("{desc}\n{}", song_lines(batch));
+/// One Ollama chat call that returns the `ids` array from its JSON reply.
+fn ask(sys: &str, user: String, model: &str) -> Result<Vec<serde_json::Value>> {
     let body = json!({
         "model": model, "stream": false, "format": "json",
         "options": {"temperature": 0.2, "num_ctx": 16384},
-        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
+        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}]
     });
     let resp: serde_json::Value = ureq::post("http://localhost:11434/api/chat")
         .send_json(body)
@@ -150,8 +185,12 @@ fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
     struct Ids {
         ids: Vec<serde_json::Value>,
     }
-    let ids: Ids = serde_json::from_str(content)?;
-    Ok(keep_known(ids_from_numbers(ids.ids, batch), batch))
+    Ok(serde_json::from_str::<Ids>(content)?.ids)
+}
+
+fn pick(batch: &[Track], desc: &str, model: &str) -> Result<Vec<String>> {
+    let ids = ask(SYSTEM, format!("{desc}\n{}", song_lines(batch)), model)?;
+    Ok(keep_known(ids_from_numbers(ids, batch), batch))
 }
 
 fn valid_date(s: &str) -> bool {
@@ -202,24 +241,9 @@ fn fill_order(ids: Vec<String>, picks: &[Track]) -> Vec<String> {
 
 // ponytail: one ordering call for all picks; skipped above 150 picks (keeps pick order), batch it if that matters
 fn order(picks: &[Track], vibe: &str, model: &str) -> Result<Vec<String>> {
-    let user = format!("{vibe}\n{}", song_lines(picks));
     let sys = r#"Arrange these songs into a playlist whose sequence follows the vibe profile's flow from start to end. Return JSON {"ids": [...]} containing the number of every song exactly once, in playing order."#;
-    let body = json!({
-        "model": model, "stream": false, "format": "json",
-        "options": {"temperature": 0.2, "num_ctx": 16384},
-        "messages": [{"role": "system", "content": sys}, {"role": "user", "content": user}]
-    });
-    let resp: serde_json::Value = ureq::post("http://localhost:11434/api/chat")
-        .send_json(body)
-        .map_err(|e| format!("Ollama request failed ({e}); start Ollama and run: ollama pull {model}"))?
-        .into_json()?;
-    let content = resp["message"]["content"].as_str().ok_or("no message.content in Ollama reply")?;
-    #[derive(Deserialize)]
-    struct Ids {
-        ids: Vec<serde_json::Value>,
-    }
-    let ids: Ids = serde_json::from_str(content)?;
-    Ok(fill_order(ids_from_numbers(ids.ids, picks), picks))
+    let ids = ask(sys, format!("{vibe}\n{}", song_lines(picks)), model)?;
+    Ok(fill_order(ids_from_numbers(ids, picks), picks))
 }
 
 fn create_apple_playlist(name: &str, ids: &[String]) -> Result<usize> {
@@ -229,7 +253,21 @@ fn create_apple_playlist(name: &str, ids: &[String]) -> Result<usize> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) if e == "--help" => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Err(e) if e == "--version" => {
+            println!("playmx {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     if args.source == "apple" {
         println!("Reading your Music library…");
         let tracks = read_favorites()?;
@@ -248,9 +286,24 @@ mod tests {
 
     fn tr(id: &str, added: Option<&str>, played: Option<&str>) -> Track {
         Track {
-            id: id.into(), name: "n".into(), artist: "a".into(), album: "al".into(), genre: "g".into(),
+            id: id.into(), name: "n".into(), artist: "a".into(), genre: "g".into(),
             added: added.map(Into::into), played: played.map(Into::into),
         }
+    }
+
+    #[test]
+    fn args() {
+        let p = |a: &[&str]| parse_args(a.iter().map(|s| s.to_string()));
+        let a = |m: &str, s: &str| Ok(Args { model: m.into(), source: s.into() });
+        assert_eq!(p(&[]), a("qwen2.5:7b", "spotify"));
+        assert_eq!(p(&["--model", "x", "--source", "apple"]), a("x", "apple"));
+        assert_eq!(p(&["--model=x", "--source=apple"]), a("x", "apple"));
+        assert_eq!(p(&["-h"]), Err("--help".into()));
+        assert_eq!(p(&["-V"]), Err("--version".into()));
+        assert!(p(&["--bogus"]).unwrap_err().contains("--bogus"));
+        assert!(p(&["--model"]).unwrap_err().contains("--model"));
+        assert!(p(&["--model", "--source", "apple"]).unwrap_err().contains("--model"));
+        assert!(p(&["--source", "nope"]).unwrap_err().contains("nope"));
     }
 
     #[test]
@@ -306,7 +359,7 @@ mod tests {
     #[test]
     fn apple_match() {
         let t = |id: &str, n: &str, a: &str| Track {
-            id: id.into(), name: n.into(), artist: a.into(), album: String::new(), genre: String::new(),
+            id: id.into(), name: n.into(), artist: a.into(), genre: String::new(),
             added: None, played: None,
         };
         let apple = [t("A1", "Mr. Brightside - 2004 Remaster", "The Killers"), t("A2", "Song", "A")];
