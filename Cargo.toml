@@ -14,5 +14,5 @@ base64 = "0.22"
 url = "2"
 
 [[bin]]
-name = "playlistMixer"
+name = "playmx"
 path = "src/main.rs"
